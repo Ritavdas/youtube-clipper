@@ -4,20 +4,7 @@ import cors from "cors";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
-import { createClient } from "@supabase/supabase-js";
-
 dotenv.config();
-
-// --- Supabase setup ---
-const supabaseUrl = process.env.SUPABASE_URL as string;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY as string;
-const bucketName = process.env.SUPABASE_BUCKET || "videos";
-if (!supabaseUrl || !supabaseServiceKey) {
-	throw new Error("Supabase credentials are not set in environment variables");
-}
-const supabase = createClient(supabaseUrl, supabaseServiceKey, {
-	auth: { persistSession: false },
-});
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -56,7 +43,7 @@ interface Job {
 	created_at?: string;
 }
 
-// In-memory job store as fallback when database is unavailable
+// In-memory job store
 const jobStore = new Map<string, Job>();
 
 function createJobId() {
@@ -126,29 +113,9 @@ app.post("/api/clip", async (req, res) => {
 		created_at: new Date().toISOString(),
 	};
 
-	// Store job in memory as fallback
+	// Store job in memory
 	jobStore.set(id, initialJobData);
-
-	// Try to insert into database, but continue if it fails (database optional)
-	try {
-		const { error: insertError } = await supabase
-			.from("jobs")
-			.insert([initialJobData]);
-
-		if (insertError) {
-			console.warn(
-				`[job ${id}] failed to create job in database (continuing without DB):`,
-				insertError
-			);
-		} else {
-			console.log(`[job ${id}] created and saved to database.`);
-		}
-	} catch (dbError) {
-		console.warn(
-			`[job ${id}] database unavailable (continuing without DB):`,
-			dbError
-		);
-	}
+	console.log(`[job ${id}] created and saved to memory.`);
 
 	(async () => {
 		let finalJobStatus: { [key: string]: any } = {};
@@ -361,25 +328,6 @@ app.post("/api/clip", async (req, res) => {
 			if (tempCookiesPath && fs.existsSync(tempCookiesPath)) {
 				fs.unlinkSync(tempCookiesPath);
 			}
-			// Try to update database, but continue if it fails (database optional)
-			try {
-				const { error: updateError } = await supabase
-					.from("jobs")
-					.update(finalJobStatus)
-					.eq("id", id);
-
-				if (updateError) {
-					console.warn(
-						`[job ${id}] failed to update final job status in database:`,
-						updateError
-					);
-				}
-			} catch (dbError) {
-				console.warn(
-					`[job ${id}] database unavailable for update:`,
-					dbError
-				);
-			}
 		}
 	})();
 
@@ -389,30 +337,7 @@ app.post("/api/clip", async (req, res) => {
 app.get("/api/clip/:id", async (req, res) => {
 	const { id } = req.params;
 
-	// Try database first
-	try {
-		const { data: job, error } = await supabase
-			.from("jobs")
-			.select("*")
-			.eq("id", id)
-			.single();
-
-		if (!error && job) {
-			return res.json({
-				status: job.status,
-				error: job.error,
-				url: job.public_url,
-				storagePath: job.storage_path,
-			});
-		}
-	} catch (dbError) {
-		console.warn(
-			`[job ${id}] database unavailable, checking in-memory store:`,
-			dbError
-		);
-	}
-
-	// Fallback to in-memory store
+	// Check in-memory store
 	const memoryJob = jobStore.get(id);
 	if (memoryJob) {
 		return res.json({
@@ -423,28 +348,13 @@ app.get("/api/clip/:id", async (req, res) => {
 		});
 	}
 
-	console.log(`[job ${id}] not found in database or memory`);
+	console.log(`[job ${id}] not found in memory`);
 	return res.status(404).json({ error: "job not found" });
 });
 
 // Cleanup endpoint for frontend to delete files after download
 app.delete("/api/clip/:id/cleanup", async (req, res) => {
 	const { id } = req.params;
-
-	// Try to delete from database
-	try {
-		const { error } = await supabase.from("jobs").delete().eq("id", id);
-
-		if (error && error.code !== "PGRST116") {
-			console.warn(`[job ${id}] job cleanup delete error:`, error);
-		} else {
-			console.log(
-				`[job ${id}] job metadata cleaned up successfully from database`
-			);
-		}
-	} catch (dbError) {
-		console.warn(`[job ${id}] database unavailable for cleanup:`, dbError);
-	}
 
 	// Remove local file
 	const localFilePath = path.join(uploadsDir, `clip-${id}.mp4`);
@@ -455,7 +365,7 @@ app.delete("/api/clip/:id/cleanup", async (req, res) => {
 		console.warn(`[job ${id}] failed to delete local file:`, fileError);
 	}
 
-	// Also remove from in-memory store
+	// Remove from in-memory store
 	jobStore.delete(id);
 	console.log(`[job ${id}] removed from in-memory store`);
 
@@ -666,80 +576,17 @@ app.get("/api/ping", (_req, res) => {
 
 app.get("/", (req, res) => res.send("Server is alive!"));
 
-// Test Supabase connection
-app.get("/api/test-supabase", async (req, res) => {
-	try {
-		console.log("Testing Supabase connection...");
-		console.log("Bucket name:", bucketName);
-
-		// Test bucket access
-		const { data: buckets, error: bucketError } =
-			await supabase.storage.listBuckets();
-		if (bucketError) {
-			console.error("Bucket list error:", bucketError);
-			return res
-				.status(500)
-				.json({ error: "Failed to list buckets", details: bucketError });
-		}
-
-		console.log(
-			"Available buckets:",
-			buckets?.map((b) => b.name)
-		);
-
-		// Test bucket contents
-		const { data: files, error: fileError } = await supabase.storage
-			.from(bucketName)
-			.list();
-		if (fileError) {
-			console.error("File list error:", fileError);
-			return res
-				.status(500)
-				.json({ error: "Failed to list files", details: fileError });
-		}
-
-		console.log(
-			"Files in bucket:",
-			files?.map((f) => f.name)
-		);
-
-		return res.json({
-			success: true,
-			bucketName,
-			buckets: buckets?.map((b) => b.name),
-			files: files?.map((f) => f.name),
-		});
-	} catch (err) {
-		console.error("Supabase test error:", err);
-		return res
-			.status(500)
-			.json({ error: "Supabase test failed", details: err });
-	}
-});
 
 // Clean up old job files on startup
-async function cleanupOldJobs() {
-	const twentyFourHoursAgo = new Date(
-		Date.now() - 24 * 60 * 60 * 1000
-	).toISOString();
-
-	console.log("Cleaning up old jobs from database...");
-	try {
-		const { data, error } = await supabase
-			.from("jobs")
-			.delete()
-			.lt("created_at", twentyFourHoursAgo);
-
-		if (error) {
-			console.warn(
-				"Error during database job cleanup (database may not exist):",
-				error
-			);
-		} else if (data) {
-			console.log(`Cleaned up old jobs from database.`);
+function cleanupOldJobs() {
+	console.log("Cleaning up old jobs from memory...");
+	const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
+	
+	for (const [id, job] of jobStore.entries()) {
+		if (job.created_at && new Date(job.created_at).getTime() < twentyFourHoursAgo) {
+			jobStore.delete(id);
+			console.log(`[job ${id}] cleaned up from memory`);
 		}
-	} catch (dbError) {
-		console.warn("Database unavailable for cleanup:", dbError);
 	}
 }
 
@@ -747,5 +594,6 @@ app.listen(port, () => {
 	console.log(`Server is running on port ${port}`);
 	console.log(`Environment: ${process.env.NODE_ENV}`);
 	console.log(`CORS origin: ${allowedOrigin}`);
+	console.log(`Database: disabled (using in-memory storage)`);
 	cleanupOldJobs();
 });
